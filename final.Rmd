@@ -1,0 +1,753 @@
+---
+title: "Modeling COVID19 Growth Pattern and Fatality Rate"
+date: " "
+author: "Xuanjun Gong"
+output: html_document
+---
+
+```{r echo=TRUE, eval=TRUE, include=F}
+
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, echo=FALSE)
+
+library(tidyverse)
+require(maps)
+require(viridis)
+library(countrycode)
+library(lubridate)
+library(RColorBrewer)
+library(dtwclust)
+library(qwraps2)
+options(qwraps2_markup = "markdown")
+library(kableExtra)
+library(ggplot2)
+library(lmerTest)
+library(GGally)
+```
+
+## Background
+Emerging infectious diseases such as SARS-CoV-2, which causes coronavirus disease 2019 (COVID-19), pose a substantial challenge to global public health. COVID-19 a fast spreading fatal contagious disease, it is critically important to understand what factors might impact the growth of cases and death across different countries in order to make fast-adapting and effective public heath policy strategies. 
+
+In this report, I am interested in how temporal factors, spatial factors and social demographic factors influence the spreading, and mortality rate of COVID-19 during the last 2 years. For temporal factors, I want to investigate if the seasonality effect COVID-19 spreading and fatality, based on the prevailing theory that Spring and Fall, compared to summer and winter, will have a larger spreading efficiency for virus. This is because the temperature and humidity are strong drivers of transmission of virus.  
+
+In addition, countries in different regions might also have different cases growth and mortality rate patterns, since people's activity, environment, and climate are largely determined by the spatial distribution of the countries as well as the interaction between spatial factors and temporal factors. Thus I will study the interaction between temporal and the spatial factor on cases and fatality rate. 
+
+In the end, I will study how social factors impact COVID-19 spreading and mortality rate. I predict that both of these two outcome variables can be effected by population demographics, such as median age, since  people in different age has different level of vulnerability to COVID-19, and population density, as well as economic variables, such as gross domestic product (GDP) and human development index (HDI), since COVID-19 death is largely determined by the medical resources and vaccination rate which is determined by the economic status of the country.
+
+## Dataset
+The dataset is collected from the [Our World in Data](https://ourworldindata.org/coronavirus), which includes daily cases and death counts for each country and location in the world. In addition, it also gives country-level demographic variables such as population density and median age, as well as economic variables such as GDP and HDI. In the current project, a total of 177 countries are included in the data for analysis, based on the following two criterions: 1) countries/region without a iso3c code is removed, 2) countries/region with missing data for GDP, HDI, population density, and median age is removed, 3) country/region with duplicate date is removed due to ambiguity to identify valid data. Moreover, the daily cases and death data ranging from 2020-03-01 to 2022-02-28 are included to cover the four seasons from 2020 Spring to 2022 Winter across two years. And smoothed daily cases and death per million people are used as new case and new death variables, because 1) remove the artificial weekly fluctuation due to hospital report patterns, 2) to balance out the influence of population base on cases and death since country with larger population are naturally to have larger cases growth.  
+
+I did data pre-processing, including, data wrangling, cleaning, and necessary transforming. I aggregated the time series dataset grouped by country, month, and year, and calculated the sum of new cases, new death, and morality rate (death divided by case), which results in a aggregated dataset with 177(country)\*2(year)\*4(season) rows, as well as a raw dataset with 177(country)*730(day) rows.
+
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+global <- read_csv("https://covid.ourworldindata.org/data/owid-covid-data.csv")
+world_map <- map_data("world")
+
+end_date <- as.Date("2022-02-28")
+start_date <- as.Date("2020-03-01")
+dates <- seq(start_date, end_date,by = 1)
+
+global$location <- countrycode(global$location, origin = 'country.name', destination = 'iso3c')
+world_map$location <- countrycode(world_map$region, origin = 'country.name', destination = 'iso3c')
+```
+
+```{r raw dataset}
+global_aggregate <- global %>%
+  group_by(location) %>%
+  select(location, population_density, median_age, gdp_per_capita, human_development_index) %>%
+  filter(row_number()==1) %>%
+  drop_na() %>%
+  ungroup()
+
+countries <- unique(global_aggregate$location)
+countries <- countries[!countries == "CYP"]
+
+global <- global %>%
+  filter(location %in% countries & 
+           date >= start_date &
+           date <= end_date) %>%
+  select(location, continent, date,
+         new_cases_smoothed_per_million,
+         new_deaths_smoothed_per_million,
+         population_density,
+         median_age,
+         gdp_per_capita,
+         human_development_index)
+
+global <- global %>%
+  mutate("month" = month(date),
+         "year" = ifelse(date < as.Date("2021-03-01"), 1, 2),
+         "season" = case_when(
+           (month(date) >=3 & month(date) <6) ~ "spring",
+           (month(date) >=6 & month(date) <9) ~ "summer",
+           (month(date) >=9 & month(date) <12) ~ "fall",
+           (month(date) ==12 | month(date) <3) ~ "winter"),
+         "region" = countrycode(location,
+                                origin='iso3c',
+                                destination = 'un.regionsub.name')
+         ) %>%
+  replace_na(list(new_deaths_smoothed_per_million = 0,
+             new_cases_smoothed_per_million = 0))
+
+
+global_complete <- complete(global, location, date) %>%
+  replace_na(list(new_deaths_smoothed_per_million = 0,
+             new_cases_smoothed_per_million = 0))
+
+
+```
+
+```{r raw matrix}
+n_date <- length(unique(global$date))
+n_country <- length(unique(global$location))
+
+case_matrix <- matrix(global_complete$new_cases_smoothed_per_million, byrow=T,
+                         nrow=n_country,
+                         ncol=n_date)
+colnames(case_matrix) <- unique(global$date)
+rownames(case_matrix) <- unique(global$location)
+death_matrix <- matrix(global_complete$new_deaths_smoothed_per_million, byrow=T,
+                         nrow=n_country,
+                         ncol=n_date)
+colnames(death_matrix) <- unique(global$date)
+rownames(death_matrix) <- unique(global$location)
+
+mortality_matrix <- (death_matrix/case_matrix)
+mortality_matrix[mortality_matrix==Inf] <- 0
+
+```
+
+```{r aggregated dataset}
+ts_df_season <- global %>%
+  group_by(location, continent, region, season, year) 
+
+ts_df_season_summary <- ts_df_season %>%
+  summarise(case = mean(new_cases_smoothed_per_million),
+            death = mean(new_deaths_smoothed_per_million),
+            mortality = ifelse(case==0, 0, death/case),
+            median_age = mean(median_age),
+            population_density = mean(population_density),
+            gdp = mean(gdp_per_capita),
+            hdi = mean(human_development_index)) %>%
+  ungroup()
+
+ts_df_season_summary$year <- as.factor(ts_df_season_summary$year)
+
+
+```
+
+
+## Exploratory Analysis
+
+### Descriptive Statistics
+I did an initial exploratory analysis to investigate the temporal and spatial effects on cases and death. There are 177 countries included in the dataset. 
+
+
+```{r}
+
+country_summary <- global %>% group_by(location) %>% filter(row_number()==1) %>% ungroup()
+pie(table(country_summary$continent))
+
+prop.conti <- as.data.frame(table(country_summary$continent)/sum(table(country_summary$continent)))
+colnames(prop.conti) <- c("Continent", "Freq")
+prop.conti %>%
+  kbl(caption = "Proportion of countries in each continent") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+```
+
+
+Then, I plotted the distribution for each variables.
+
+
+```{r}
+ts_df_season_summary %>%
+  keep(is.numeric) %>%                     # Keep only numeric columns
+  gather() %>%                             # Convert to key-value pairs
+  ggplot(aes(value)) +                     # Plot the values
+    facet_wrap(~ key, scales = "free") +   # In separate panels
+    geom_density()
+```
+
+I found that the new case, death, mortality, population density, and gdp is not normally distributed but instead follows a heavy right tailed distribution. Thus I transformed these variables by log transformation after adding a small number (0.01) to it. Then I plotted the distribution again.
+
+
+```{r}
+ts_df_season_summary %>%
+  mutate(case = log(case+0.01),
+         death = log(death+0.01),
+         mortality = log(mortality+0.01),
+         population_density=log(population_density),
+         gdp=log(gdp)) %>%
+  keep(is.numeric) %>%                     # Keep only numeric columns
+  gather() %>%                             # Convert to key-value pairs
+  ggplot(aes(value)) +                     # Plot the values
+    facet_wrap(~ key, scales = "free") +   # In separate panels
+    geom_density()
+
+ts_df_season_summary <- ts_df_season_summary %>%
+  mutate(case = log(case+0.01),
+         death = log(death+0.01),
+         mortality = log(mortality+0.01),
+         population_density=log(population_density),
+         gdp=log(gdp))
+```
+
+
+First I calculated descriptive statistics for average log case/death per day and log mortality rate, across different continent and seasons. 
+
+
+```{r, results = "asis"}
+our_summary1 <-
+  list("Average Log Case Per Day" =
+       list("median"    = ~ median(case),
+            "mean (sd)" = ~ qwraps2::mean_sd(case)),
+       "Average Log Death Per Day" =
+       list("median"    = ~ median(death),
+            "mean (sd)" = ~ qwraps2::mean_sd(death)),
+       "Average Log Morality Per Day" =
+       list("median"    = ~ median(mortality),
+            "mean (sd)" = ~ qwraps2::mean_sd(mortality))
+       )
+summary_table(ts_df_season_summary, our_summary1, by=c("season"))
+summary_table(ts_df_season_summary, our_summary1, by=c("continent"))
+
+```
+
+
+I also calculated the descriptive statistics for log GDP, HDI, median age, and log population density as the following: 
+
+
+```{r, results = "asis"}
+
+our_summary2 <-
+  list("Log GDP" =
+       list(
+            "median"    = ~ median(gdp_per_capita),
+            "mean (sd)" = ~ qwraps2::mean_sd(gdp_per_capita)),
+       "HDI" =
+       list(
+            "median"    = ~ median(human_development_index),
+            "mean (sd)" = ~ qwraps2::mean_sd(human_development_index)),
+       "Median Age" =
+       list(
+            "median"    = ~ median(median_age),
+            "mean (sd)" = ~ qwraps2::mean_sd(median_age)),
+       "Log Population Density" =
+       list(
+            "median"    = ~ median(population_density),
+            "mean (sd)" = ~ qwraps2::mean_sd(population_density))
+       )
+summary_table(country_summary, our_summary2)
+summary_table(country_summary, our_summary2, by=c("continent"))
+```
+
+To explore the relationship between interested variables, I plotted the scatter plot for all continuous variables in different seasons. 
+
+
+```{r}
+
+ggpairs(ts_df_season_summary %>% select(season, continent, death, mortality, median_age, population_density, gdp, hdi), columns=3:8, aes(color=season, alpha = 0.4),
+        lower = list(continuous = wrap("points", alpha = 0.3,    size=0.1), 
+              combo = wrap("dot", alpha = 0.4,            size=0.2) ))
+
+```
+
+### Clustering Analysis
+To explore the underlying spatial distribution of COVID-19 spreading and mortality patterns, I plotted the smoothed log transformed time series data for each day and each country. 
+
+```{r}
+matplot(t(log(case_matrix+0.01)), type="l", xlab="days",
+        ylab="smoothed log new cases per day per million people",
+        main="Log case daily time series for each country")
+matplot(t(log(death_matrix+0.01)), type="l", xlab="days",
+        ylab="smoothed log new deaths per day per million people",
+        main="Log death daily time series for each country")
+matplot(t(log(mortality_matrix+0.01)), type="l", xlab="days",
+        ylab="log morality rate per day",
+        main="Log morality daily time series for each country")
+```
+
+
+To understand how spatial factors impact COVID-19 new cases and new death across countries. I applied a clustering algorithm, a shape-based distance clustering, to cluster the log transformed time series for each country. The clustering results are shown below.
+
+
+```{r message=FALSE, warning=FALSE}
+pc_case <- tsclust(log(case_matrix+0.01), type = "partitional", k = 6,
+                  distance = "sbd", centroid = "shape",
+                  trace = TRUE, seed = 1234)
+pc_death <- tsclust(log(death_matrix+0.01), type = "partitional", k = 6,
+                  distance = "sbd", centroid = "shape",
+                  trace = TRUE, seed = 1234)
+
+case_cluster <- pc_case@cluster
+death_cluster <- pc_death@cluster
+
+plot(pc_case)
+plot(pc_death)
+
+centroids_plots_case <- vector('list', 6)
+for (i in 1:6) {
+  temp <- pc_case@centroids[[i]]
+  temp_df <- data.frame(t=1:length(temp), cases=temp)
+  centroids_plots_case[[i]] <- ggplot(temp_df, aes(x=t, y=cases)) +  
+  geom_line(linetype = "solid", color = brewer.pal(n = 7, name = "Set2")[i+1], size=1) +
+    ggtitle(paste("Case Cluster", i))
+}
+centroids_plots_death <- vector('list', 6)
+for (i in 1:6) {
+  temp <- pc_death@centroids[[i]]
+  temp_df <- data.frame(t=1:length(temp), death=temp)
+  centroids_plots_death[[i]] <- ggplot(temp_df, aes(x=t, y=death)) +  
+  geom_line(linetype = "solid", color = brewer.pal(n = 7, name = "Set2")[i+1], size=1)+
+    ggtitle(paste("Death Cluster", i))
+}
+
+library(gridExtra)
+grid.arrange(grobs = c(centroids_plots_case, centroids_plots_death), ncol = 3)
+
+```
+
+
+Then I plotted how these COVID-19 growth pattern are spatially distributed in the world map. This plot indicates that the growth pattern are meaningfully distributed globally. These pattern might suggest the spatial factors are strong predictors of the COVID-19 growth pattern.
+
+
+```{r}
+cluster_df <- as.data.frame(list("region"=unique(global$location),
+                                 "c.cluster"=case_cluster,
+                                 "d.cluster"=death_cluster))
+
+
+world_map_cluster <- left_join(cluster_df, world_map, by = c("region"="location"))
+
+ggplot(world_map_cluster, aes(long, lat, group = group))+
+  geom_polygon(aes(fill = as.factor(c.cluster)), color = "white")
+ggplot(world_map_cluster, aes(long, lat, group = group))+
+  geom_polygon(aes(fill = as.factor(d.cluster)), color = "white")
+```
+
+### Exploratory Analysis
+Next, I plotted how the new cases/death and mortality are temporally distributed. I plotted the boxplot of these variables among the 4 seasons over 2 years. I found that 1) there seems exists a seasonal pattern for fatality rate of COVID-19, that during the spring and fall season fatality increase and during the summer and winter fatality decreases, 2) the seasonal pattern seems also exists for new cases that winter has the highest cases, and sprint has the lowest cases, 3) there exists interaction between continent and seasons for new cases and mortality. 
+
+
+```{r, warning=FALSE}
+
+ts_df_season_summary %>%
+  ggplot(aes(x=as.factor(continent), y=case, 
+             fill=factor(season))) +
+           geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ts_df_season_summary %>%
+  ggplot(aes(x=as.factor(continent), y=death, 
+             fill=factor(season))) +
+           geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ts_df_season_summary  %>% 
+  ggplot(aes(x=as.factor(continent),
+             y=mortality,
+             fill=factor(season))) +
+           geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+
+## Proposed Model - Mixed effect model
+I propose to fit a mixed effect ANOVA model with outcome variables as log cases and log mortality rate, and predictor variables as the temporal factors (season), the spatial factors (continent), and social factors (median age, GDP, HDI, and population density). And I will test the main effect and interaction effect of these terms, with F test reduced/full test. 
+
+The proposed model goes as follow:
+
+$$
+Y = \mu +Season_i+Continent_j+SeasonContinent_{ij}+\alpha_k+\beta GPD+\gamma HDI+\delta MedianAge+\lambda PopulationDensity + \epsilon
+$$
+Where
+
+$$
+\sum_{i}^{a} Season_i = 
+\sum_{j}^{b} Continent_j = 
+\sum_{i}^{a} SeaonsContinent_{ij} = \sum_{j}^{b} SeaonsContinent_{ij} =0
+$$
+
+$$
+\alpha \overset{\text{iid}}{\sim} \ N (0,\sigma_{\alpha}^2)
+$$
+$$
+\epsilon  \overset{\text{iid}}{\sim} N(0, \sigma^2) 
+$$
+
+It includes fixed effect factors as the temporal variables (season), spatial variables (continent) and interaction between season and continent, a random effect factors as the country identity $\alpha_k$, and four covariates variables as the four social factors (GPD, HDI, Population density, and Median age). 
+
+## Model Results
+
+I first fitted the model for the mortality rate, with stepwise regression model comparision given by TestLmer package. I found that there is a main effect for both season and continent as well as an interaction effect between season and continent. In addition, the covariate HDI, but not median agen, population density and GDP, significantly explains the morality rate. The random effect for country identity is also a significant predictor. 
+
+```{r}
+full_mod_mortality <- lmer(mortality~continent*season+(1|location)+gdp+hdi+median_age+population_density,
+         data=ts_df_season_summary)  # full model
+step(full_mod_mortality)
+
+```
+
+Next, I fitted the mixed effect model for log cases growth for each country. Similar to mortality rate, I found the fixed effects from season, continent and the interaction effect between season and continent are significant, as well as the random effect from country identity are all significant. Moreover, HDI also significantly explains the case growth. But median_age, population density, and GDP does not significantly explains the case growth. 
+
+```{r}
+full_mod_case <- lmer(case~continent*season+(1|location)+gdp+hdi+median_age+population_density,
+         data=ts_df_season_summary)  # full model
+step(full_mod_case)
+```
+
+Thus, the final model fitted is the following:
+
+$$
+Y = \mu +Season_i+Continent_j+SeasonContinent_{ij}+\alpha_k+\beta HDI + \epsilon
+$$
+Where
+
+$$
+\sum_{i}^{a} Season_i = 
+\sum_{j}^{b} Continent_j = 
+\sum_{i}^{a} SeaonsContinent_{ij} = \sum_{j}^{b} SeaonsContinent_{ij} =0
+$$
+
+$$
+\alpha \overset{\text{iid}}{\sim} \ N (0,\sigma_{\alpha}^2)
+$$
+$$
+\epsilon  \overset{\text{iid}}{\sim} N(0, \sigma^2) 
+$$
+
+## Model diagnostics and sensitivity analysis.
+
+For the final mixed effect models I fitted, I checked the assumptions by the residual vs. fitted value plots, and the QQ plot for the residuals. The residual vs. fitted value plots indicates 1) the model does not violate equal variance assumption as residuals are roughly equally distributed across fitted values, 2) the model does not voilate linearity assumption as the residuals are centered around 0 across fitted values. However, the QQ plot indicates the model might have violate the normality assumption, as the residuals does not follow a normal distribution. 
+
+```{r}
+model_mortality<- lmer(mortality ~ continent + season + (1 | location) + hdi + continent:season,
+                   data=ts_df_season_summary)
+
+plot(model_mortality)
+qqnorm(residuals(model_mortality)); qqline(residuals(model_mortality), col = 2,lwd=2,lty=2)
+```
+
+```{r}
+model_case <- lmer(case ~ continent + season + (1 | location) + hdi + continent:season,
+                   data=ts_df_season_summary)
+
+plot(model_case)
+qqnorm(residuals(model_case)); qqline(residuals(model_case), col = 2,lwd=2,lty=2)
+```
+
+### Non-parametric Model - Rank model
+
+For assumption remedies, I transformed the cases and mortality into rank and fitted the same model with the rank of the non-parametric model. The result of this model suggest that similar to the result for the parameric model, the effect of season, continent, interaction between continent and season as well as the HDI are all significant predictor of the cases and mortality rate. In addition, the qq plot of the residuals also shows good normality assumptions. Thus, this sensitivity analysis increased our confidence for the fitted model. 
+
+```{r}
+ts_df_season_summary$rank.case <- rank(ts_df_season_summary$case)
+ts_df_season_summary$rank.mortality <- rank(ts_df_season_summary$mortality)
+
+rank_case <- lmer(rank.case ~ continent + season + (1 | location) + hdi + continent:season,
+                      data=ts_df_season_summary)
+anova(rank_case)
+rank_mortality <- lmer(rank.mortality ~ continent + season + (1 | location) + hdi + continent:season,
+         data=ts_df_season_summary)  # full model
+anova(rank_mortality)
+
+qqnorm(residuals(rank_case)); qqline(residuals(rank_case), col = 2,lwd=2,lty=2)
+qqnorm(residuals(rank_mortality)); qqline(residuals(rank_mortality), col = 2,lwd=2,lty=2)
+```
+
+
+
+## Model interpretation and discussion for causal inference.
+The final fitted model is a mixed effect model with three types of factors: 1) a fixed effect factor for temporal (season) and spatial (continent) factors and their interaction terms, 2) a random effect factor for each country to have different intercept, 3) a regression covariate factor for social economic variable HDI. All three types of factors are significant predictor for both cases growth and mortality rate across different countries. Thus, this analysis indicates that 1) the seasons and location of the country influences how COVID-19 spreads and causing death, 2) in different location in the world, season has different impact on cases and mortality rate, 3) the social economic factors, HDI, influences how COVID-19 spreading and causing deaths. 
+
+There exists several caveats in the current project. First, I failed to make causal inference from the obvervational data. Since this dataset includes only longitudinal observation dataset, making inference about causality is particularly difficulty due to the lack of randomization of factors. For instance, the observed influence of season and continent on COVID-19 cases might be simply due to the effect of time. As time goes on, there are more and more cases and lower and lower mortality case due to invention of vaccine, etc. Or it could be due to the evolution and mutation of the virus which coincident with the seasons. Thus, I can only conclude with association rather than casual relationships, because I can not exclude out the influence of the possible confounding variables. 
+
+Nevertheless, this project revealed that the interaction between seasonality and countries' location significantly predicts COVID-19 spreading the mortality rate. In addition, countries' social economic status such as HDI significantly explained COVID-19 case and mortality rate as well. Thus these results inform public health policy maker how to adapt the societal contagion disease control policies based on the reason, the location of the place, and the economic factors of the society.
+
+
+## Reference
+Ritchie, H., Mathieu, E., Rodés-Guirao, L., Appel, C., Giattino, C., Ortiz-Ospina, E., ... & Roser, M. (2020). Coronavirus pandemic (COVID-19). Our world in data.
+
+Meesrikamolkul, W., Niennattrakul, V., & Ratanamahatana, C. A. (2012, May). Shape-based clustering for time series data. In Pacific-Asia Conference on Knowledge Discovery and Data Mining (pp. 530-541). Springer, Berlin, Heidelberg.
+
+Kuznetsova, A., Brockhoff, P. B., & Christensen, R. H. (2017). lmerTest package: tests in linear mixed effects models. Journal of statistical software, 82, 1-26.
+
+Dorélien, A. M., Ramen, A., Swanson, I., & Hill, R. (2021). Analyzing the demographic, spatial, and temporal factors influencing social contact patterns in US and implications for infectious disease spread. BMC infectious diseases, 21(1), 1-19.
+
+Chen, J., Yan, J., & Zhang, P. (2020). Clustering us states by time series of covid-19 new case counts with non-negative matrix factorization. arXiv preprint arXiv:2011.14412.
+
+## SessionInfo
+```{r}
+sessionInfo()
+```
+
+## Appendix
+```{r, eval=F, echo=T}
+global <- read_csv("https://covid.ourworldindata.org/data/owid-covid-data.csv")
+world_map <- map_data("world")
+
+end_date <- as.Date("2022-02-28")
+start_date <- as.Date("2020-03-01")
+dates <- seq(start_date, end_date,by = 1)
+
+global$location <- countrycode(global$location, origin = 'country.name', destination = 'iso3c')
+world_map$location <- countrycode(world_map$region, origin = 'country.name', destination = 'iso3c')
+
+global_aggregate <- global %>%
+  group_by(location) %>%
+  select(location, population_density, median_age, gdp_per_capita, human_development_index) %>%
+  filter(row_number()==1) %>%
+  drop_na() %>%
+  ungroup()
+
+countries <- unique(global_aggregate$location)
+countries <- countries[!countries == "CYP"]
+
+global <- global %>%
+  filter(location %in% countries & 
+           date >= start_date &
+           date <= end_date) %>%
+  select(location, continent, date,
+         new_cases_smoothed_per_million,
+         new_deaths_smoothed_per_million,
+         population_density,
+         median_age,
+         gdp_per_capita,
+         human_development_index)
+
+global <- global %>%
+  mutate("month" = month(date),
+         "year" = ifelse(date < as.Date("2021-03-01"), 1, 2),
+         "season" = case_when(
+           (month(date) >=3 & month(date) <6) ~ "spring",
+           (month(date) >=6 & month(date) <9) ~ "summer",
+           (month(date) >=9 & month(date) <12) ~ "fall",
+           (month(date) ==12 | month(date) <3) ~ "winter"),
+         "region" = countrycode(location,
+                                origin='iso3c',
+                                destination = 'un.regionsub.name')
+         ) %>%
+  replace_na(list(new_deaths_smoothed_per_million = 0,
+             new_cases_smoothed_per_million = 0))
+
+
+global_complete <- complete(global, location, date) %>%
+  replace_na(list(new_deaths_smoothed_per_million = 0,
+             new_cases_smoothed_per_million = 0))
+
+
+n_date <- length(unique(global$date))
+n_country <- length(unique(global$location))
+
+case_matrix <- matrix(global_complete$new_cases_smoothed_per_million, byrow=T,
+                         nrow=n_country,
+                         ncol=n_date)
+colnames(case_matrix) <- unique(global$date)
+rownames(case_matrix) <- unique(global$location)
+death_matrix <- matrix(global_complete$new_deaths_smoothed_per_million, byrow=T,
+                         nrow=n_country,
+                         ncol=n_date)
+colnames(death_matrix) <- unique(global$date)
+rownames(death_matrix) <- unique(global$location)
+
+mortality_matrix <- (death_matrix/case_matrix)
+mortality_matrix[mortality_matrix==Inf] <- 0
+
+
+ts_df_season <- global %>%
+  group_by(location, continent, region, season, year) 
+
+ts_df_season_summary <- ts_df_season %>%
+  summarise(case = mean(new_cases_smoothed_per_million),
+            death = mean(new_deaths_smoothed_per_million),
+            mortality = ifelse(case==0, 0, death/case),
+            median_age = mean(median_age),
+            population_density = mean(population_density),
+            gdp = mean(gdp_per_capita),
+            hdi = mean(human_development_index)) %>%
+  ungroup()
+
+ts_df_season_summary$year <- as.factor(ts_df_season_summary$year)
+
+
+country_summary <- global %>% group_by(location) %>% filter(row_number()==1) %>% ungroup()
+pie(table(country_summary$continent))
+
+prop.conti <- as.data.frame(table(country_summary$continent)/sum(table(country_summary$continent)))
+colnames(prop.conti) <- c("Continent", "Freq")
+prop.conti %>%
+  kbl(caption = "Proportion of countries in each continent") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+ts_df_season_summary %>%
+  keep(is.numeric) %>%                     # Keep only numeric columns
+  gather() %>%                             # Convert to key-value pairs
+  ggplot(aes(value)) +                     # Plot the values
+    facet_wrap(~ key, scales = "free") +   # In separate panels
+    geom_density()
+
+ts_df_season_summary %>%
+  mutate(case = log(case+0.01),
+         death = log(death+0.01),
+         mortality = log(mortality+0.01),
+         population_density=log(population_density),
+         gdp=log(gdp)) %>%
+  keep(is.numeric) %>%                     # Keep only numeric columns
+  gather() %>%                             # Convert to key-value pairs
+  ggplot(aes(value)) +                     # Plot the values
+    facet_wrap(~ key, scales = "free") +   # In separate panels
+    geom_density()
+
+ts_df_season_summary <- ts_df_season_summary %>%
+  mutate(case = log(case+0.01),
+         death = log(death+0.01),
+         mortality = log(mortality+0.01),
+         population_density=log(population_density),
+         gdp=log(gdp))
+our_summary1 <-
+  list("Average Log Case Per Day" =
+       list("median"    = ~ median(case),
+            "mean (sd)" = ~ qwraps2::mean_sd(case)),
+       "Average Log Death Per Day" =
+       list("median"    = ~ median(death),
+            "mean (sd)" = ~ qwraps2::mean_sd(death)),
+       "Average Log Morality Per Day" =
+       list("median"    = ~ median(mortality),
+            "mean (sd)" = ~ qwraps2::mean_sd(mortality))
+       )
+summary_table(ts_df_season_summary, our_summary1, by=c("season"))
+summary_table(ts_df_season_summary, our_summary1, by=c("continent"))
+
+
+our_summary2 <-
+  list("Log GDP" =
+       list(
+            "median"    = ~ median(gdp_per_capita),
+            "mean (sd)" = ~ qwraps2::mean_sd(gdp_per_capita)),
+       "HDI" =
+       list(
+            "median"    = ~ median(human_development_index),
+            "mean (sd)" = ~ qwraps2::mean_sd(human_development_index)),
+       "Median Age" =
+       list(
+            "median"    = ~ median(median_age),
+            "mean (sd)" = ~ qwraps2::mean_sd(median_age)),
+       "Log Population Density" =
+       list(
+            "median"    = ~ median(population_density),
+            "mean (sd)" = ~ qwraps2::mean_sd(population_density))
+       )
+summary_table(country_summary, our_summary2)
+summary_table(country_summary, our_summary2, by=c("continent"))
+
+ggpairs(ts_df_season_summary %>% select(season, continent, death, mortality, median_age, population_density, gdp, hdi), columns=3:8, aes(color=season, alpha = 0.4),
+        lower = list(continuous = wrap("points", alpha = 0.3,    size=0.1), 
+              combo = wrap("dot", alpha = 0.4,            size=0.2) ))
+matplot(t(log(case_matrix+0.01)), type="l", xlab="days",
+        ylab="smoothed log new cases per day per million people",
+        main="Log case daily time series for each country")
+matplot(t(log(death_matrix+0.01)), type="l", xlab="days",
+        ylab="smoothed log new deaths per day per million people",
+        main="Log death daily time series for each country")
+matplot(t(log(mortality_matrix+0.01)), type="l", xlab="days",
+        ylab="log morality rate per day",
+        main="Log morality daily time series for each country")
+
+pc_case <- tsclust(log(case_matrix+0.01), type = "partitional", k = 6,
+                  distance = "sbd", centroid = "shape",
+                  trace = TRUE, seed = 1234)
+pc_death <- tsclust(log(death_matrix+0.01), type = "partitional", k = 6,
+                  distance = "sbd", centroid = "shape",
+                  trace = TRUE, seed = 1234)
+
+case_cluster <- pc_case@cluster
+death_cluster <- pc_death@cluster
+
+plot(pc_case)
+plot(pc_death)
+
+centroids_plots_case <- vector('list', 6)
+for (i in 1:6) {
+  temp <- pc_case@centroids[[i]]
+  temp_df <- data.frame(t=1:length(temp), cases=temp)
+  centroids_plots_case[[i]] <- ggplot(temp_df, aes(x=t, y=cases)) +  
+  geom_line(linetype = "solid", color = brewer.pal(n = 7, name = "Set2")[i+1], size=1) +
+    ggtitle(paste("Case Cluster", i))
+}
+centroids_plots_death <- vector('list', 6)
+for (i in 1:6) {
+  temp <- pc_death@centroids[[i]]
+  temp_df <- data.frame(t=1:length(temp), death=temp)
+  centroids_plots_death[[i]] <- ggplot(temp_df, aes(x=t, y=death)) +  
+  geom_line(linetype = "solid", color = brewer.pal(n = 7, name = "Set2")[i+1], size=1)+
+    ggtitle(paste("Death Cluster", i))
+}
+
+library(gridExtra)
+grid.arrange(grobs = c(centroids_plots_case, centroids_plots_death), ncol = 3)
+
+
+cluster_df <- as.data.frame(list("region"=unique(global$location),
+                                 "c.cluster"=case_cluster,
+                                 "d.cluster"=death_cluster))
+
+
+world_map_cluster <- left_join(cluster_df, world_map, by = c("region"="location"))
+
+ggplot(world_map_cluster, aes(long, lat, group = group))+
+  geom_polygon(aes(fill = as.factor(c.cluster)), color = "white")
+ggplot(world_map_cluster, aes(long, lat, group = group))+
+  geom_polygon(aes(fill = as.factor(d.cluster)), color = "white")
+
+
+
+ts_df_season_summary %>%
+  ggplot(aes(x=as.factor(continent), y=case, 
+             fill=factor(season))) +
+           geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ts_df_season_summary %>%
+  ggplot(aes(x=as.factor(continent), y=death, 
+             fill=factor(season))) +
+           geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ts_df_season_summary  %>% 
+  ggplot(aes(x=as.factor(continent),
+             y=mortality,
+             fill=factor(season))) +
+           geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+full_mod_mortality <- lmer(mortality~continent*season+(1|location)+gdp+hdi+median_age+population_density,
+         data=ts_df_season_summary)  # full model
+step(full_mod_mortality)
+
+full_mod_case <- lmer(case~continent*season+(1|location)+gdp+hdi+median_age+population_density,
+         data=ts_df_season_summary)  # full model
+step(full_mod_case)
+model_mortality<- lmer(mortality ~ continent + season + (1 | location) + hdi + continent:season,
+                   data=ts_df_season_summary)
+
+plot(model_mortality)
+qqnorm(residuals(model_mortality)); qqline(residuals(model_mortality), col = 2,lwd=2,lty=2)
+
+model_case <- lmer(case ~ continent + season + (1 | location) + hdi + continent:season,
+                   data=ts_df_season_summary)
+
+plot(model_case)
+qqnorm(residuals(model_case)); qqline(residuals(model_case), col = 2,lwd=2,lty=2)
+
+ts_df_season_summary$rank.case <- rank(ts_df_season_summary$case)
+ts_df_season_summary$rank.mortality <- rank(ts_df_season_summary$mortality)
+
+rank_case <- lmer(rank.case ~ continent + season + (1 | location) + hdi + continent:season,
+                      data=ts_df_season_summary)
+anova(rank_case)
+rank_mortality <- lmer(rank.mortality ~ continent + season + (1 | location) + hdi + continent:season,
+         data=ts_df_season_summary)  # full model
+anova(rank_mortality)
+
+qqnorm(residuals(rank_case)); qqline(residuals(rank_case), col = 2,lwd=2,lty=2)
+qqnorm(residuals(rank_mortality)); qqline(residuals(rank_mortality), col = 2,lwd=2,lty=2)
+```
+
